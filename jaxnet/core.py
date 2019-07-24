@@ -1,11 +1,12 @@
 from functools import reduce
 import jax.numpy as np
 import jax.linear_util as lu
-from jax.util import unzip2, safe_zip, safe_map, partial
+from jax.util import unzip2, safe_zip, safe_map, partial, WrapHashably
 from jax.abstract_arrays import ShapedArray
 from jax.experimental import stax
 from jax.interpreters import partial_eval as pe
 from jax.interpreters.batching import get_aval
+from jax.interpreters import batching
 from jax.api_util import (
     wraps, pytree_to_jaxtupletree, pytree_fun_to_jaxtupletree_fun)
 import jax.core as jc
@@ -38,6 +39,15 @@ class Layer(jc.Primitive):
                 return apply_fun(params, *inputs)
             return pe.abstract_eval_fun(init_and_apply, akey, *avals)
         self.def_abstract_eval(layer_abstract_eval)
+        def layer_batch(batched_args, batch_dims, **params):
+            # TODO: figure out batching/debatching for init_fun
+            batched_apply_fun = (
+                lambda params, *batch_inputs:
+                batching.batch(lu.wrap_init(partial(self.apply_fun, params)),
+                               batch_inputs, batch_dims, 0))
+            batched_layer = Layer(name, init_fun, batched_apply_fun)
+            return batched_layer.bind(*batched_args, **params), 0
+        batching.primitive_batchers[self] = layer_batch
 
 def init_interpreter(rng, jaxpr, consts, freevar_vals, net_params, *args):
     def read(v):
@@ -133,7 +143,7 @@ class ApplyTrace(jc.Trace):
         return ApplyTracer(self, {}, val.val)
 
     def process_primitive(self, primitive, tracers, params):
-        vals_in, net_params = zip(*[(t.val, t.net_params) for t in tracers])
+        vals_in, net_params = unzip2((t.val, t.net_params) for t in tracers)
         net_params = merge_params(net_params)
         if isinstance(primitive, Layer):
             apply_fun = primitive.apply_fun
@@ -143,6 +153,19 @@ class ApplyTrace(jc.Trace):
         else:
             return ApplyTracer(
                 self, net_params, primitive.bind(*vals_in, **params))
+
+    def process_call(self, call_primitive, f, tracers, params):
+        if call_primitive in pe.map_primitives:
+            raise NotImplementedError
+        vals, net_params = unzip2((t.val, t.net_params) for t in tracers)
+        if any(net_params):
+            net_params = merge_params(net_params)
+            f = apply_subtrace(f, self.master, WrapHashably(net_params))
+            val_out = call_primitive.bind(f, *vals, **params)
+            return ApplyTracer(self, net_params, val_out)
+        else:
+            return call_primitive.bind(f, *vals, **params)
+
 
 @lu.transformation
 def apply_transform(net_params, inputs):
@@ -154,42 +177,14 @@ def apply_transform(net_params, inputs):
         del master, out_tracer
     yield out_val
 
+@lu.transformation
+def apply_subtrace(master, net_params, *vals):
+    net_params = net_params.val
+    trace = ApplyTrace(master, jc.cur_sublevel())
+    ans = yield map(partial(ApplyTracer, trace, dict(net_params)), vals), {}
+    out_tracer = trace.full_raise(ans)
+    yield out_tracer.val
+
+
 def apply_fun(net_fun, params, *inputs):
     return apply_transform(lu.wrap_init(net_fun), params).call_wrapped(inputs)
-
-def Dense(name, out_dim, W_init=stax.glorot(), b_init=stax.randn()):
-    """Layer constructor function for a dense (fully-connected) layer."""
-    def init_fun(rng, example_input):
-        input_shape = example_input.shape
-        k1, k2 = random.split(rng)
-        W, b = W_init(k1, (out_dim, input_shape[-1])), b_init(k2, (out_dim,))
-        return W, b
-    def apply_fun(params, inputs):
-        W, b = params
-        return np.dot(W, inputs) + b
-    return Layer(name, init_fun, apply_fun).bind
-
-
-# DENSE DEMO
-my_dense_layer = Dense('my_dense_layer', out_dim=2)
-
-example_inputs = np.array([1., 1.])  # example_inputs.shape == (2,)
-
-def dense_net_fun(inputs):
-    return my_dense_layer(2 * my_dense_layer(inputs))
-
-dense_params = init_fun(dense_net_fun, random.PRNGKey(0), example_inputs)
-dense_out = apply_fun(dense_net_fun, dense_params, example_inputs)
-
-# RNN DEMO
-def rnn_cell(hidden, inputs):
-    hidden = my_dense_layer(inputs) * my_dense_layer(hidden)
-    return hidden, hidden
-
-hidden_init = example_inputs
-def rnn(inputs):
-    return lax.scan(rnn_cell, hidden_init, inputs)
-
-rnn_example_inputs = np.stack([example_inputs, example_inputs, example_inputs])
-
-rnn_params = init_fun(rnn, random.PRNGKey(0), rnn_example_inputs)
