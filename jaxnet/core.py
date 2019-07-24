@@ -181,7 +181,7 @@ def apply_transform(net_params, inputs):
 def apply_subtrace(master, net_params, *vals):
     net_params = net_params.val
     trace = ApplyTrace(master, jc.cur_sublevel())
-    ans = yield map(partial(ApplyTracer, trace, dict(net_params)), vals), {}
+    ans = yield map(partial(ApplyTracer, trace, net_params), vals), {}
     out_tracer = trace.full_raise(ans)
     yield out_tracer.val
 
