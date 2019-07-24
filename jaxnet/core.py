@@ -1,7 +1,7 @@
 from functools import reduce
 import jax.numpy as np
 import jax.linear_util as lu
-from jax.util import unzip2, safe_zip, safe_map, partial, WrapHashably
+from jax.util import unzip2, unzip3, safe_zip, safe_map, partial, WrapHashably
 from jax.abstract_arrays import ShapedArray
 from jax.experimental import stax
 from jax.interpreters import partial_eval as pe
@@ -77,9 +77,8 @@ def init_interpreter(rng, jaxpr, consts, freevar_vals, net_params, *args):
                  map(read, const_vars),
                  map(read, bound_vars))
                 for subjaxpr, const_vars, bound_vars in eqn.bound_subjaxprs])
-            subfuns = map(lu.wrap_init, subfuns)
             ans, net_params = get_primitive_init(eqn.primitive)(
-                prim_rng, eqn.params, sub_consts, sub_freevar_val, in_vals,
+                prim_rng, eqn.params, sub_consts, sub_freevar_vals, in_vals,
                 net_params)
         else:
             ans, net_params = get_primitive_init(eqn.primitive)(

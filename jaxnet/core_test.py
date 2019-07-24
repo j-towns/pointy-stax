@@ -71,3 +71,13 @@ def test_apply_jit():
     net_fun_jitted = jit(net_fun)
     out = core.apply_fun(net_fun_jitted, params, example_inputs)
     assert out.shape == (3,)
+
+def test_init_jit():
+    example_inputs = random.normal(RNG, (2,))
+
+    @jit
+    def net_fun(inputs):
+        return 2 * layer(inputs)
+    params = core.init_fun(net_fun, RNG, example_inputs)
+    out = core.apply_fun(net_fun, params, example_inputs)
+    assert out.shape == (3,)
