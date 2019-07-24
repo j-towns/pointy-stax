@@ -17,17 +17,6 @@ zip = safe_zip
 map = safe_map
 
 
-RNG = [random.PRNGKey(0)]
-
-def sample_rng():
-    key1, key2 = random.split(RNG.pop())
-    RNG.append(key1)
-    return key2
-
-def set_rng(key):
-    RNG.pop()
-    RNG.append(key)
-
 def merge_params(params):
     if len(params) > 0:
         p = params[0]
@@ -37,11 +26,11 @@ def merge_params(params):
     else:
         return {}
 
-class StaxLayer(jc.Primitive):
+class Layer(jc.Primitive):
     def __init__(self, name, init_fun, apply_fun):
         self.init_fun = init_fun
         self.apply_fun = apply_fun
-        super(StaxLayer, self).__init__(name)
+        super(Layer, self).__init__(name)
         def layer_abstract_eval(*avals):
             akey = ShapedArray((2,), 'uint32')
             def init_and_apply(key, *inputs):
@@ -50,67 +39,70 @@ class StaxLayer(jc.Primitive):
             return pe.abstract_eval_fun(init_and_apply, akey, *avals)
         self.def_abstract_eval(layer_abstract_eval)
 
-class InitTracer(jc.Tracer):
-    __slots__ = ['val', 'net_params']
-
-    def __init__(self, trace, net_params, val):
-        self.trace = trace
-        self.val = val
-        self.net_params = net_params
-
-    @property
-    def aval(self):
-        return jc.get_aval(self.val)
-
-    def unpack(self):
-        return tuple(self.val)
-
-    def full_lower(self):
-        return self
-
-class InitTrace(jc.Trace):
-    def pure(self, val):
-        return InitTracer(self, {}, val)
-
-    def lift(self, val):
-        return InitTracer(self, {}, val)
-
-    def sublift(self, val):
-        return InitTracer(self, {}, val.val)
-
-    def process_primitive(self, primitive, tracers, params):
-        vals_in, net_params = zip(*[(t.val, t.net_params) for t in tracers])
-        net_params = merge_params(net_params)
-        if isinstance(primitive, StaxLayer):
-            apply_fun = primitive.apply_fun
-            if primitive.name in net_params:
-                layer_params = net_params[primitive.name]
-            else:
-                init_fun = primitive.init_fun
-                layer_params = init_fun(sample_rng(), *vals_in)
-                net_params[primitive.name] = layer_params
-            return InitTracer(
-                self, net_params, apply_fun(layer_params, *vals_in))
+def init_interpreter(rng, jaxpr, consts, freevar_vals, net_params, *args):
+    def read(v):
+        if type(v) is jc.Literal:
+            return v.val
         else:
-            return InitTracer(
-                self, net_params, primitive.bind(*vals_in, **params))
+            return env[v]
 
-@lu.transformation_with_aux
-def init_transform(rng, inputs):
-    set_rng(rng)
-    with jc.new_master(InitTrace) as master:
-        trace = InitTrace(master, jc.cur_sublevel())
-        ans = yield map(partial(InitTracer, trace, {}), inputs), {}
-        out_tracer = trace.full_raise(ans)
-        out_val, net_params = out_tracer.val, out_tracer.net_params
-        del master, out_tracer
-    yield out_val, net_params
+    def write(v, val):
+        env[v] = val
 
-def init_fun(net_fun, rng, *example_inputs):
+    env = {}
+    write(jc.unitvar, jc.unit)
+    jc.pat_fmap(write, jaxpr.constvars, consts)
+    jc.pat_fmap(write, jaxpr.invars, args)
+    jc.pat_fmap(write, jaxpr.freevars, freevar_vals)
+    for eqn in jaxpr.eqns:
+        rng, prim_rng = random.split(rng)
+        if not eqn.restructure:
+            in_vals = map(read, eqn.invars)
+        else:
+            in_vals = [pack(map(read, invars)) if type(invars) is tuple
+                       else read(invars) for invars in eqn.invars]
+        if eqn.bound_subjaxprs:
+            subjaxprs, sub_consts, sub_freevar_vals = unzip3([
+                (subjaxpr,
+                 map(read, const_vars),
+                 map(read, bound_vars))
+                for subjaxpr, const_vars, bound_vars in eqn.bound_subjaxprs])
+            subfuns = map(lu.wrap_init, subfuns)
+            ans, net_params = get_primitive_init(eqn.primitive)(
+                prim_rng, eqn.params, sub_consts, sub_freevar_val, in_vals,
+                net_params)
+        else:
+            ans, net_params = get_primitive_init(eqn.primitive)(
+                prim_rng, net_params, *in_vals, **eqn.params)
+        outvals = list(ans) if eqn.destructure else [ans]
+        map(write, eqn.outvars, outvals)
+    return net_params
+
+init_rules = {}
+
+def layer_init(layer, rng, net_params, *inputs):
+    if layer.name not in net_params:
+        layer_params = layer.init_fun(rng, *inputs)
+        net_params[layer.name] = layer_params
+    return layer.apply_fun(net_params[layer.name], *inputs), net_params
+
+def get_primitive_init(primitive):
+    if primitive in init_rules:
+        return primitive
+    elif isinstance(primitive, Layer):
+        return partial(layer_init, primitive)
+    else:
+        return (lambda _, net_params, *in_vals, **params:
+                (primitive.bind(*in_vals, **params), net_params))
+
+def init_fun(net_fun, rng, *example_inputs, **kwargs):
     net_fun = lu.wrap_init(net_fun)
-    net_fun, net_params = init_transform(net_fun, rng)
-    net_fun.call_wrapped(example_inputs)
-    return net_params()
+    def pv_like(x):
+        return pe.PartialVal((get_aval(x), jc.unit))
+    pvals = map(pv_like, example_inputs)
+    jaxpr, _, consts = pe.trace_to_jaxpr(net_fun, pvals, **kwargs)
+    return init_interpreter(rng, jaxpr, consts, [], {}, *example_inputs)
+
 
 class ApplyTracer(jc.Tracer):
     __slots__ = ['val', 'net_params']
@@ -143,7 +135,7 @@ class ApplyTrace(jc.Trace):
     def process_primitive(self, primitive, tracers, params):
         vals_in, net_params = zip(*[(t.val, t.net_params) for t in tracers])
         net_params = merge_params(net_params)
-        if isinstance(primitive, StaxLayer):
+        if isinstance(primitive, Layer):
             apply_fun = primitive.apply_fun
             layer_params = net_params[primitive.name]
             return ApplyTracer(
@@ -175,7 +167,7 @@ def Dense(name, out_dim, W_init=stax.glorot(), b_init=stax.randn()):
     def apply_fun(params, inputs):
         W, b = params
         return np.dot(W, inputs) + b
-    return StaxLayer(name, init_fun, apply_fun).bind
+    return Layer(name, init_fun, apply_fun).bind
 
 
 # DENSE DEMO
